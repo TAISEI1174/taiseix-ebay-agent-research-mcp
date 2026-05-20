@@ -2,31 +2,31 @@
 
 ## 現在の状態
 
-- 新規 GitHub リポジトリ用の最小構成として、Python + Starlette + FastMCP の MCP サーバーを作成した。
-- MCP ツールは `search` と `fetch` の 2 つだけにしている。
-- `search` は eBay Browse API `item_summary/search` を呼び、`id`、`title`、`url` を返す。
-- `fetch` は eBay Browse API `getItem` を呼び、商品リサーチ用の `EBAY_PRODUCT_RESEARCH_START` 形式を `text` に入れて返す。
-- `output_schema` は使っていない。FastMCP の `structured_output=False` で JSON text content として返す。
-- `/` は health check、`/mcp` は MCP endpoint。
-- `/mcp` は `Authorization: Bearer <MCP_API_KEY>` で保護している。
+- 1つの MCP サーバーに4ツールを登録している。
+- `search` / `fetch` は Custom MCP 検索コネクタ用。
+- `ebay_product_research` / `fetch_ebay_item` は Agent 明示アクション用。
+- `primary_use_case` は health check の説明項目だけで、MCPツールではない。
+- `output_schema` は使っていない。
+- `ebay_product_research` と `fetch_ebay_item` は `str` を返す。
+- `search` と `fetch` は connector 互換の JSON text content を返す。
 
-## まだ実装していないもの
+## tools/list 成功条件
 
-- Trading API `GetMyMessages`
-- Google Sheets 保存
-- 自動実行
-- スコアリング
-- 利益率計算
-- sold/completed listings の取得
+`tools/list` に以下4つが出ること。
+
+```text
+search
+fetch
+ebay_product_research
+fetch_ebay_item
+```
 
 ## Render で確認すること
 
-1. `GET /` が `status: ok` を返す。
-2. `configured.MCP_API_KEY`、`configured.EBAY_APP_ID`、`configured.EBAY_CERT_ID` が `true`。
-3. ChatGPT Custom MCP App が `/mcp` に接続できる。
-4. `search` と `fetch` がツール一覧に出る。
-5. `search` が商品候補を返す。
-6. `fetch` が `EBAY_PRODUCT_RESEARCH_START` 形式を返す。
+1. `GET /` の `available_tools` が4つ。
+2. `/mcp` の `tools/list` 実結果が4つ。
+3. `ebay_product_research` が `EBAY_PRODUCT_RESEARCH_START` 形式を返す。
+4. `fetch_ebay_item` が `EBAY_PRODUCT_RESEARCH_START` 形式を返す。
 
 ## 注意
 

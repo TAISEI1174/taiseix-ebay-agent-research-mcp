@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ebay-agent-research-mcp
+    name: taiseix-ebay-agent-actions-mcp
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
