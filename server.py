@@ -21,14 +21,23 @@ from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 
-SERVICE_NAME = "ebay-agent-research-mcp"
+SERVICE_NAME = "ebay-agent-actions-mcp"
 MCP_PATH = "/mcp"
 EBAY_BROWSE_BASE_URL = "https://api.ebay.com/buy/browse/v1"
 EBAY_OAUTH_TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 EBAY_OAUTH_SCOPE = "https://api.ebay.com/oauth/api_scope"
 DEFAULT_MARKETPLACE_ID = "EBAY_US"
 DEFAULT_SEARCH_LIMIT = 10
+EBAY_SEARCH_API_LIMIT = 50
 REQUEST_TIMEOUT_SECONDS = 20
+MIN_SELLER_FEEDBACK_SCORE = 50
+MIN_SELLER_FEEDBACK_PERCENTAGE = 95.0
+TRADING_CARD_CATEGORY_KEYWORDS = (
+    "ccg individual cards",
+    "trading card",
+    "collectible card game",
+    "sports trading cards",
+)
 
 CONFIG_KEYS = [
     "MCP_API_KEY",
@@ -219,17 +228,18 @@ def safe_http_error(prefix: str, response: requests.Response) -> str:
     return f"{prefix}: status={response.status_code}, body={body}"
 
 
-def browse_search(query: str) -> dict[str, Any]:
+def browse_search(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> dict[str, Any]:
     cleaned_query = query.strip()
     if not cleaned_query:
         raise ValueError("query must not be empty")
 
+    api_limit = max(1, min(int(limit), EBAY_SEARCH_API_LIMIT))
     response = requests.get(
         f"{EBAY_BROWSE_BASE_URL}/item_summary/search",
         headers=ebay_headers(),
         params={
             "q": cleaned_query,
-            "limit": DEFAULT_SEARCH_LIMIT,
+            "limit": api_limit,
             "offset": 0,
         },
         timeout=REQUEST_TIMEOUT_SECONDS,
@@ -270,6 +280,39 @@ def strip_item_prefix(raw_id: str) -> str:
     return raw_id
 
 
+def extract_item_ids(raw_id: str) -> list[str]:
+    raw = raw_id.strip()
+    if not raw:
+        return []
+
+    parsed_ids: list[Any] | None = None
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            parsed_ids = parsed
+        elif isinstance(parsed, dict):
+            value = parsed.get("ids") or parsed.get("id") or parsed.get("item_ids")
+            if isinstance(value, list):
+                parsed_ids = value
+            elif isinstance(value, str):
+                parsed_ids = [value]
+
+    if parsed_ids is None:
+        parsed_ids = raw.replace("\n", ",").replace(";", ",").split(",")
+
+    cleaned_ids: list[str] = []
+    seen: set[str] = set()
+    for item_id in parsed_ids:
+        cleaned = strip_item_prefix(str(item_id).strip().strip('"').strip("'"))
+        if cleaned and cleaned not in seen:
+            cleaned_ids.append(cleaned)
+            seen.add(cleaned)
+    return cleaned_ids
+
+
 def first_image_url(item: dict[str, Any]) -> str:
     image = item.get("image") or {}
     if image.get("imageUrl"):
@@ -301,6 +344,36 @@ def seller_info(item: dict[str, Any]) -> dict[str, str]:
         "feedback_score": str(seller.get("feedbackScore", "")),
         "feedback_percentage": str(seller.get("feedbackPercentage", "")),
     }
+
+
+def parse_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except ValueError:
+        return None
+
+
+def parse_percentage(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace("%", "").replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def seller_filter_exclusion_reason(item: dict[str, Any]) -> str | None:
+    seller = seller_info(item)
+    score = parse_int(seller["feedback_score"])
+    percentage = parse_percentage(seller["feedback_percentage"])
+    reasons: list[str] = []
+    if score is not None and score < MIN_SELLER_FEEDBACK_SCORE:
+        reasons.append(f"seller feedback score {score} < {MIN_SELLER_FEEDBACK_SCORE}")
+    if percentage is not None and percentage < MIN_SELLER_FEEDBACK_PERCENTAGE:
+        reasons.append(f"seller feedback percentage {percentage:g}% < {MIN_SELLER_FEEDBACK_PERCENTAGE:g}%")
+    return "; ".join(reasons) if reasons else None
 
 
 def location_summary(item: dict[str, Any]) -> str:
@@ -342,6 +415,98 @@ def category_summary(item: dict[str, Any]) -> str:
     return ""
 
 
+def is_trading_card_category(item: dict[str, Any]) -> bool:
+    category = category_summary(item).lower()
+    return any(keyword in category for keyword in TRADING_CARD_CATEGORY_KEYWORDS)
+
+
+def location_country(item: dict[str, Any]) -> str:
+    location = item.get("itemLocation") or {}
+    return one_line(location.get("country") or location.get("countryName"))
+
+
+def is_china_location(item: dict[str, Any]) -> bool:
+    location = item.get("itemLocation") or {}
+    values = [
+        location.get("country"),
+        location.get("countryName"),
+        location.get("city"),
+        location.get("stateOrProvince"),
+        location_summary(item),
+    ]
+    normalized = " ".join(str(value).lower() for value in values if value)
+    country = str(location.get("country") or "").upper()
+    return "china" in normalized or country == "CN"
+
+
+def risk_rank(level: str) -> int:
+    return {"LOW": 0, "MEDIUM": 1, "HIGH": 2}[level]
+
+
+def evaluate_research_risk(item: dict[str, Any]) -> dict[str, str]:
+    seller = seller_info(item)
+    score = parse_int(seller["feedback_score"])
+    percentage = parse_percentage(seller["feedback_percentage"])
+
+    seller_reasons: list[str] = []
+    if score is None:
+        seller_reasons.append("seller feedback score missing")
+    elif score < MIN_SELLER_FEEDBACK_SCORE:
+        seller_reasons.append(f"seller feedback score {score} below {MIN_SELLER_FEEDBACK_SCORE}")
+
+    if percentage is None:
+        seller_reasons.append("seller feedback percentage missing")
+    elif percentage < MIN_SELLER_FEEDBACK_PERCENTAGE:
+        seller_reasons.append(f"seller feedback percentage {percentage:g}% below {MIN_SELLER_FEEDBACK_PERCENTAGE:g}%")
+
+    if any("below" in reason for reason in seller_reasons):
+        seller_risk = "HIGH"
+    elif seller_reasons:
+        seller_risk = "MEDIUM"
+    else:
+        seller_risk = "LOW"
+        seller_reasons.append(
+            f"feedback score {score} and percentage {percentage:g}% meet threshold"
+        )
+
+    category = category_summary(item)
+    if not category:
+        category_risk = "MEDIUM"
+        category_reason = "category information missing"
+    elif is_trading_card_category(item):
+        category_risk = "LOW"
+        category_reason = "category matches CCG / Trading Card"
+    else:
+        category_risk = "HIGH"
+        category_reason = f"category does not look like CCG / Trading Card: {category}"
+
+    country = location_country(item)
+    if is_china_location(item):
+        location_risk = "HIGH"
+        location_reason = "item location is CN/China"
+    elif not country:
+        location_risk = "MEDIUM"
+        location_reason = "item location country missing"
+    elif country.upper() == "US":
+        location_risk = "LOW"
+        location_reason = "item location is US"
+    else:
+        location_risk = "MEDIUM"
+        location_reason = f"item location is outside US: {country}"
+
+    risk_levels = [seller_risk, category_risk, location_risk]
+    research_risk = max(risk_levels, key=risk_rank)
+    reason = "; ".join(["; ".join(seller_reasons), category_reason, location_reason])
+
+    return {
+        "seller_risk": seller_risk,
+        "category_risk": category_risk,
+        "location_risk": location_risk,
+        "research_risk": research_risk,
+        "reason": reason,
+    }
+
+
 def one_line(value: Any) -> str:
     if value is None:
         return ""
@@ -361,6 +526,7 @@ def build_research_text(items: list[dict[str, Any]], query: str) -> str:
     for index, item in enumerate(items, start=1):
         price, currency = best_price(item)
         seller = seller_info(item)
+        risk = evaluate_research_risk(item)
         lines.extend(
             [
                 f"[{index}]",
@@ -379,6 +545,11 @@ def build_research_text(items: list[dict[str, Any]], query: str) -> str:
                 f"ShippingSummary: {one_line(shipping_summary(item))}",
                 f"Category: {one_line(category_summary(item))}",
                 f"ListingMarketplaceId: {one_line(item.get('listingMarketplaceId'))}",
+                f"SellerRisk: {risk['seller_risk']}",
+                f"CategoryRisk: {risk['category_risk']}",
+                f"LocationRisk: {risk['location_risk']}",
+                f"ResearchRisk: {risk['research_risk']}",
+                f"Reason: {one_line(risk['reason'])}",
                 "",
             ]
         )
@@ -392,12 +563,15 @@ async def health(_: Request) -> JSONResponse:
         {
             "status": "ok",
             "service": SERVICE_NAME,
-            "message": "MCP server is running",
             "mcp_endpoint": MCP_PATH,
-            "available_tools": ["search", "fetch"],
-            "primary_use_case": "ebay_product_research",
+            "available_tools": [
+                "search",
+                "fetch",
+                "ebay_product_research",
+                "fetch_ebay_item",
+            ],
+            "primary_use_case": "agent_actions_for_ebay_product_research",
             "marketplace": marketplace_id(),
-            "configured": configured_status(),
         }
     )
 
@@ -405,8 +579,8 @@ async def health(_: Request) -> JSONResponse:
 mcp = FastMCP(
     name=SERVICE_NAME,
     instructions=(
-        "Read-only eBay product research MCP server. Use search first to find eBay "
-        "items, then fetch one returned id to retrieve research-ready product details."
+        "Read-only eBay product research MCP server. Use search/fetch for Custom "
+        "MCP connector flows and ebay_product_research/fetch_ebay_item for Agent actions."
     ),
     host="0.0.0.0",
     port=int(env("PORT", "8000") or "8000"),
@@ -419,11 +593,7 @@ mcp = FastMCP(
 @mcp.tool(
     name="search",
     title="Search eBay items",
-    description=(
-        "Use this when the user wants to search eBay listings for product research. "
-        "Input is one natural-language query string. Returns JSON text containing "
-        "results with id, title, and canonical eBay url."
-    ),
+    description="Search eBay listings for connector fetch.",
     annotations=ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -433,9 +603,21 @@ mcp = FastMCP(
     structured_output=False,
 )
 def search(query: str) -> list[TextContent]:
-    payload = browse_search(query)
+    payload = browse_search(query, EBAY_SEARCH_API_LIMIT)
     results = []
+    excluded = []
     for item in payload.get("itemSummaries", []) or []:
+        exclusion_reason = seller_filter_exclusion_reason(item)
+        if exclusion_reason:
+            excluded.append(
+                {
+                    "id": prefixed_item_id(str(item.get("itemId", ""))),
+                    "title": str(item.get("title", "")),
+                    "reason": exclusion_reason,
+                }
+            )
+            continue
+
         item_id = item.get("itemId")
         title = item.get("title")
         url = item.get("itemWebUrl") or item.get("itemAffiliateWebUrl")
@@ -447,16 +629,25 @@ def search(query: str) -> list[TextContent]:
                     "url": str(url),
                 }
             )
-    return mcp_json({"results": results})
+            if len(results) >= DEFAULT_SEARCH_LIMIT:
+                break
+
+    return mcp_json(
+        {
+            "results": results,
+            "metadata": {
+                "result_count": len(results),
+                "result_count_basis": "after seller feedback filtering",
+                "excluded_count": len(excluded),
+            },
+        }
+    )
 
 
 @mcp.tool(
     name="fetch",
     title="Fetch eBay item research details",
-    description=(
-        "Use this when the user has an id returned by search and needs detailed eBay "
-        "product research data. Returns JSON text with id, title, text, url, and metadata."
-    ),
+    description="Fetch connector item details by search result id.",
     annotations=ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -466,24 +657,99 @@ def search(query: str) -> list[TextContent]:
     structured_output=False,
 )
 def fetch(id: str) -> list[TextContent]:
-    item_id = strip_item_prefix(id)
-    item = browse_get_item(item_id)
-    title = str(item.get("title") or item_id)
-    url = str(item.get("itemWebUrl") or item.get("itemAffiliateWebUrl") or "")
-    text = build_research_text([item], query=f"fetch:{item_id}")
+    item_ids = extract_item_ids(id)
+    if not item_ids:
+        raise ValueError("id must include at least one eBay item id")
+
+    items: list[dict[str, Any]] = []
+    fetched_item_ids: list[str] = []
+    failed_items: list[dict[str, str]] = []
+    for item_id in item_ids:
+        try:
+            items.append(browse_get_item(item_id))
+            fetched_item_ids.append(item_id)
+        except Exception as exc:
+            failed_items.append({"id": prefixed_item_id(item_id), "error": str(exc)})
+
+    if not items:
+        raise EbayApiError(f"No eBay items could be fetched: {failed_items}")
+
+    first_item = items[0]
+    first_item_id = str(first_item.get("itemId") or fetched_item_ids[0])
+    is_batch = len(items) > 1
+    title = (
+        f"eBay product research batch ({len(items)} items)"
+        if is_batch
+        else str(first_item.get("title") or first_item_id)
+    )
+    url = str(first_item.get("itemWebUrl") or first_item.get("itemAffiliateWebUrl") or "")
+    text = build_research_text(items, query=f"fetch:{', '.join(fetched_item_ids)}")
     return mcp_json(
         {
-            "id": prefixed_item_id(item_id),
+            "id": f"ebay_fetch_batch|{len(items)}" if is_batch else prefixed_item_id(first_item_id),
             "title": title,
             "text": text,
             "url": url,
             "metadata": {
                 "source": "eBay Browse API",
                 "marketplace": marketplace_id(),
-                "item_id": item_id,
+                "item_ids": [
+                    prefixed_item_id(str(item.get("itemId") or fallback_item_id))
+                    for item, fallback_item_id in zip(items, fetched_item_ids)
+                ],
+                "result_count": len(items),
+                "failed_items": failed_items,
             },
         }
     )
+
+
+@mcp.tool(
+    name="ebay_product_research",
+    title="eBay product research",
+    description="Run eBay product research by query.",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+def ebay_product_research(query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> str:
+    requested_limit = max(1, min(int(limit), EBAY_SEARCH_API_LIMIT))
+    logger.info(
+        "=== TOOL CALLED: ebay_product_research ===\nquery: %s\nlimit: %s",
+        one_line(query),
+        requested_limit,
+    )
+    payload = browse_search(query, requested_limit)
+    items = list(payload.get("itemSummaries", []) or [])[:requested_limit]
+    return build_research_text(items, query=query)
+
+
+@mcp.tool(
+    name="fetch_ebay_item",
+    title="Fetch eBay item",
+    description="Fetch one eBay item by item id.",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+    structured_output=False,
+)
+def fetch_ebay_item(item_id: str) -> str:
+    logger.info(
+        "=== TOOL CALLED: fetch_ebay_item ===\nitem_id: %s",
+        one_line(item_id),
+    )
+    cleaned_item_id = strip_item_prefix(item_id.strip())
+    if not cleaned_item_id:
+        raise ValueError("item_id must not be empty")
+    item = browse_get_item(cleaned_item_id)
+    return build_research_text([item], query=f"fetch_ebay_item:{cleaned_item_id}")
 
 
 mcp_asgi_app = mcp.streamable_http_app()
